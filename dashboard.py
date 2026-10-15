@@ -7,7 +7,7 @@ LOG_DIR = Path(r"C:\mystic\logs")
 HOST = "0.0.0.0"
 PORT = 8765
 
-STAMP = re.compile(r"^(\d{4}\.\d{2}\.\d{2})\s+(\d{2}:\d{2}:\d{2})\s+(.*)$")
+STAMP = re.compile(r"^\s*\+?\s*(\d{4}\.\d{2}\.\d{2})\s+(\d{2}:\d{2}:\d{2})\s+(.*)$")
 CONNECT = re.compile(r"Connect from\s+([0-9a-fA-F:.]+)(?:\s+\((.*?)\))?", re.I)
 COUNTRY = re.compile(r"Country:\s*(.+?)\s*$", re.I)
 LOGIN = re.compile(r"(.+?)\s+logged in\s*$", re.I)
@@ -22,6 +22,26 @@ def parse_line(line):
         return datetime(y, mo, d, hh, mm, ss), m.group(3)
     except (ValueError, TypeError):
         return None, ""
+
+# Mystic mis.log uses a leading "+ DD.MM.YYYY HH:MM:SS" timestamp.
+# Accept both that format and the ISO-like format used by some log versions.
+_MIS_STAMP = re.compile(
+    r"^\s*\+?\s*(\d{2}\.\d{2}\.\d{4}|\d{4}\.\d{2}\.\d{2})\s+(\d{2}:\d{2}:\d{2})\s+(.*)$"
+)
+def _parse_mis_timestamp(line):
+    m = _MIS_STAMP.match(line)
+    if not m:
+        return None, line.strip()
+    try:
+        parts = [int(part) for part in m.group(1).split(".")]
+        if len(m.group(1).split(".")[0]) == 4:
+            year, month, day = parts
+        else:
+            day, month, year = parts
+        hh, mm, ss = (int(part) for part in m.group(2).split(":"))
+        return datetime(year, month, day, hh, mm, ss), m.group(3)
+    except (ValueError, TypeError):
+        return None, m.group(3)
 
 
 # Incremental cache for mis.log: parse existing lines once, then only appended bytes.
@@ -57,15 +77,15 @@ def _parse_mis_line(line):
     is_blocked = "blocked connection" in low
     is_binkp_event = "binkp" in low and ("connect on slot" in low or "session ended" in low)
     if is_blocked or is_binkp_event:
-        dt, msg = parse_line(line)
-        if is_blocked:
+        # Parse the actual mis.log date format (DD.MM.YYYY, often prefixed by '+').
+        dt, msg = _parse_mis_timestamp(line)
+        # Count only dated events so period filtering is accurate.
+        if dt and is_blocked:
             cache["blocked"] += 1
-            if dt:
-                cache["events"].append({"time": dt.isoformat(timespec="seconds"), "type": "Blocked connection", "detail": msg})
-        if is_binkp_event:
+            cache["events"].append({"time": dt.isoformat(timespec="seconds"), "type": "Blocked connection", "detail": msg})
+        if dt and is_binkp_event:
             cache["binkp"] += 1
-            if dt:
-                cache["events"].append({"time": dt.isoformat(timespec="seconds"), "type": "BinkP event", "detail": msg})
+            cache["events"].append({"time": dt.isoformat(timespec="seconds"), "type": "BinkP event", "detail": msg})
 
     # Almost all Mystic log lines do not contain BINKP; skip all slot/transfer
     # regular expressions for those lines.
@@ -392,10 +412,23 @@ def build_stats(period="30"):
     mis = LOG_DIR/"mis.log"
     _refresh_mis_cache()
     with _MIS_CACHE_LOCK:
-        blocked = _MIS_CACHE["blocked"]
-        binkp = _MIS_CACHE["binkp"]
-        events = list(_MIS_CACHE["events"])
+        all_events = list(_MIS_CACHE["events"])
         mis_available = _MIS_CACHE["available"]
+    # Apply the same selected-period window used by the dashboard to security events.
+    visible_events = []
+    for event in all_events:
+        try:
+            event_time = datetime.fromisoformat(event["time"])
+        except (KeyError, ValueError, TypeError):
+            continue
+        if start is not None and event_time < start:
+            continue
+        if period_end is not None and event_time >= period_end:
+            continue
+        visible_events.append(event)
+    blocked = sum(1 for event in visible_events if event.get("type") == "Blocked connection")
+    binkp = sum(1 for event in visible_events if event.get("type") == "BinkP event")
+    events = visible_events
     _mis_elapsed = time.perf_counter() - _mis_t0
     print("TIMING mis.log events/cache refresh: {:.2f}s".format(_mis_elapsed), flush=True)
     _network_t0 = time.perf_counter()
