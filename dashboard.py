@@ -370,6 +370,44 @@ def read_nodelist_files():
     found.sort(key=lambda x: (x["network"].lower(), x["name"].lower()))
     return found[:100]
 
+
+# Incremental cache for file-download events found in node*.log.
+_DOWNLOAD_LINE = re.compile(
+    r"^\s*(\d{4}\.\d{2}\.\d{2})\s+(\d{2}:\d{2}:\d{2})\s+(?:Download|Downloaded):\s*(.+?)\s*$",
+    re.I,
+)
+_DOWNLOAD_CACHE = {"signature": None, "events": []}
+_DOWNLOAD_CACHE_LOCK = __import__("threading").RLock()
+
+def _refresh_download_cache(files):
+    signature = tuple((str(f), f.stat().st_size, f.stat().st_mtime_ns)
+                      for f in files if f.exists())
+    with _DOWNLOAD_CACHE_LOCK:
+        if signature == _DOWNLOAD_CACHE["signature"]:
+            return list(_DOWNLOAD_CACHE["events"])
+        events = []
+        for path in files:
+            try:
+                with path.open("r", encoding="utf-8", errors="replace") as handle:
+                    for line in handle:
+                        match = _DOWNLOAD_LINE.match(line)
+                        if not match:
+                            continue
+                        try:
+                            y, mo, d = (int(part) for part in match.group(1).split("."))
+                            hh, mm, ss = (int(part) for part in match.group(2).split(":"))
+                            when = datetime(y, mo, d, hh, mm, ss)
+                        except ValueError:
+                            continue
+                        filename = match.group(3).strip()
+                        if filename:
+                            events.append({"time": when.isoformat(timespec="seconds"), "file": filename})
+            except OSError:
+                continue
+        _DOWNLOAD_CACHE["signature"] = signature
+        _DOWNLOAD_CACHE["events"] = events
+        return list(events)
+
 def build_stats(period="30"):
     _build_t0 = time.perf_counter()
     now = datetime.now()
@@ -408,6 +446,39 @@ def build_stats(period="30"):
         daily[day]["connections"] += 1
         if s["login_success"]: daily[day]["logins"] += 1
     durations = [s["duration_seconds"] for s in visible if s["login_success"] and s["duration_seconds"] is not None]
+    # Rank authenticated users by number of sessions in the selected period.
+    user_session_counts = {}
+    for session in visible:
+        username = (session.get("user") or "").strip()
+        if not session.get("login_success") or not username:
+            continue
+        key = username.casefold()
+        if key not in user_session_counts:
+            user_session_counts[key] = {"user": username, "sessions": 0}
+        user_session_counts[key]["sessions"] += 1
+    top_users = sorted(user_session_counts.values(),
+                       key=lambda item: (-item["sessions"], item["user"].casefold()))[:10]
+    # Rank downloaded files from Mystic node logs, using the selected period.
+    download_events = _refresh_download_cache(files)
+    file_download_counts = {}
+    for event in download_events:
+        try:
+            event_time = datetime.fromisoformat(event["time"])
+        except (KeyError, ValueError, TypeError):
+            continue
+        if start is not None and event_time < start:
+            continue
+        if period_end is not None and event_time >= period_end:
+            continue
+        filename = (event.get("file") or "").strip()
+        if not filename:
+            continue
+        key = filename.casefold()
+        if key not in file_download_counts:
+            file_download_counts[key] = {"file": filename, "downloads": 0}
+        file_download_counts[key]["downloads"] += 1
+    top_files = sorted(file_download_counts.values(),
+                       key=lambda item: (-item["downloads"], item["file"].casefold()))[:10]
     _mis_t0 = time.perf_counter()
     mis = LOG_DIR/"mis.log"
     _refresh_mis_cache()
@@ -451,7 +522,7 @@ def build_stats(period="30"):
       "closed":sum(s["end_reason"]=="Logged off" for s in visible),"unresolved":sum(not s["ended_at"] for s in visible),
       "avg_session_seconds":int(sum(durations)/len(durations)) if durations else None,
       "countries":[{"name":k,"count":v,"percent":round(v*100/len(visible),1) if visible else 0} for k,v in sorted(countries.items(),key=lambda kv:(-kv[1],kv[0]))],
-      "daily":chart_days,"sessions":visible[:150],"blocked_attempts":blocked,"binkp_events":binkp,
+      "daily":chart_days,"sessions":visible[:150],"top_users":top_users,"top_files":top_files,"blocked_attempts":blocked,"binkp_events":binkp,
       "mis_log_available":mis_available,"mis_events":sorted(events,key=lambda x:x["time"],reverse=True)[:30],"network_stats":{k:v for k,v in network_stats.items() if k != "latest"},"nodelists":read_nodelist_files(),"errors":errors}
 
 HTML = r'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AltairMini BBS Monitor — Mystic Edition</title>
@@ -509,7 +580,7 @@ html,body{height:100%;overflow:hidden}
 header{height:54px;padding:5px 12px;gap:10px}
 h1{font-size:16px}header p{font-size:10px;margin-top:1px}
 main{height:calc(100vh - 54px);min-height:0;max-width:none;padding:6px 10px;gap:6px;overflow:hidden;
-grid-template-rows:18px 54px 54px minmax(135px,1.05fr) minmax(150px,1.1fr) 112px 12px}
+grid-template-rows:18px 54px 54px minmax(95px,.75fr) minmax(105px,.75fr) minmax(215px,1.55fr) 12px}
 .card{padding:6px 9px;border-radius:9px}
 .cards{gap:6px}
 .klabel{font-size:9px;letter-spacing:.35px}
@@ -518,7 +589,7 @@ grid-template-rows:18px 54px 54px minmax(135px,1.05fr) minmax(150px,1.1fr) 112px
 .layout{gap:7px;min-height:0;min-width:0}
 .panel{padding:7px 9px;border-radius:9px;min-height:0;min-width:0;overflow:hidden}
 .panel h2{font-size:12px;margin:0 0 5px}
-.chart{height:92px}
+.chart{height:72px}
 .note{padding:3px 7px;font-size:9px}
 .barrow{margin:3px 0;font-size:9px}
 .countries-panel{display:flex;flex-direction:column;min-height:0}
@@ -527,9 +598,14 @@ grid-template-rows:18px 54px 54px minmax(135px,1.05fr) minmax(150px,1.1fr) 112px
 .network-panel .sub{font-size:9px;margin:0}
 .network-table{flex:1 1 auto;min-height:0;overflow:auto}
 .network-table th,.network-table td{padding:2px 4px;font-size:9px;line-height:1.05}
-.events-table,.nodelists-table{height:72px;min-height:0;overflow:auto;flex:1 1 auto}
-.events-table th,.events-table td,.nodelists-table th,.nodelists-table td{padding:2px 4px;font-size:9px;line-height:1.05}
-.extra-panels{min-height:0;align-items:stretch}
+.events-table,.nodelists-table,.top-users-table,.top-files-table{height:130px;min-height:0;overflow:auto;flex:1 1 auto}
+.scroll{min-height:0;scrollbar-width:auto;scrollbar-color:#87939b #26333c; scrollbar-gutter:stable}
+.scroll::-webkit-scrollbar,.countries-list::-webkit-scrollbar{width:13px;height:13px}
+.scroll::-webkit-scrollbar-track,.countries-list::-webkit-scrollbar-track{background:#26333c;border-radius:6px}
+.scroll::-webkit-scrollbar-thumb,.countries-list::-webkit-scrollbar-thumb{background:#87939b;border:2px solid #26333c;border-radius:6px}
+.scroll::-webkit-scrollbar-thumb:hover,.countries-list::-webkit-scrollbar-thumb:hover{background:#b0bac0}
+.events-table th,.events-table td,.nodelists-table th,.nodelists-table td,.top-users-table th,.top-users-table td,.top-files-table th,.top-files-table td{padding:3px 5px;font-size:10px;line-height:1.1}
+.extra-panels{min-height:0;align-items:stretch;grid-template-columns:repeat(2,minmax(0,1fr))}
 .extra-panels .panel{height:auto;min-height:0}
 footer{font-size:9px;line-height:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 /* Bright blue stock-ticker flash: only changed values/rows pulse, then return to normal */
@@ -543,8 +619,8 @@ tr.ticker-update td{animation:tickerRowPulse 1.65s ease-out 1 !important}
 @media(max-height:760px){
  header{height:48px;padding:4px 10px}
  main{height:calc(100vh - 48px);padding:5px 8px;gap:5px;
- grid-template-rows:16px 48px 48px minmax(115px,1fr) minmax(130px,1.05fr) 95px 10px}
- .value{font-size:19px}.panel{padding:6px 8px}.chart{height:75px}
+ grid-template-rows:16px 48px 48px minmax(85px,.7fr) minmax(95px,.7fr) minmax(185px,1.35fr) 10px}
+ .value{font-size:19px}.panel{padding:6px 8px}.chart{height:62px}
  .extra-panels .panel{min-height:0}
 }
 @media(max-width:900px){
@@ -566,7 +642,7 @@ tr.ticker-update td{animation:tickerRowPulse 1.65s ease-out 1 !important}
 <section class="layout"><div class="panel"><h2>Daily activity</h2><svg id="chart" class="chart" viewBox="0 0 700 180" preserveAspectRatio="none"></svg><div class="sub">Bars: connections; line: successful logins. Chart shows the last 30 days.</div></div><div class="panel countries-panel"><h2>Countries</h2><div id="countries" class="countries-list"></div></div></section>
 <section class="layout"><div class="panel"><h2>Recent Sessions</h2><div class="scroll"><table><thead><tr><th>Time</th><th>Node</th><th>IP / Country</th><th>User</th><th>Protocol</th><th>Result</th></tr></thead><tbody id="sessions"></tbody></table></div></div>
 <div class="panel network-panel"><h2>Inbound Packets &amp; Files by Network</h2><div class="sub" id="networkSummary">Reading inbound transfers from poll.log and newer mis.log events</div><div class="scroll network-table"><table><thead><tr><th>Network</th><th>Received files</th><th>Share</th><th>Last received</th></tr></thead><tbody id="networks"></tbody></table></div></div></section>
-<section class="layout extra-panels"><div class="panel"><h2>Recent BinkP / Block Events</h2><div class="scroll events-table"><table><thead><tr><th>Time</th><th>Event</th><th>Details</th></tr></thead><tbody id="events"></tbody></table></div></div><div class="panel"><h2>Nodelist Files</h2><div class="sub">Detected nodelist files, last modification and size</div><div class="scroll nodelists-table"><table><thead><tr><th>Network</th><th>File</th><th>Last modified</th><th>Size</th></tr></thead><tbody id="nodelists"></tbody></table></div></div></section>
+<section class="layout extra-panels"><div class="panel"><h2>Recent BinkP / Block Events</h2><div class="scroll events-table"><table><thead><tr><th>Time</th><th>Event</th><th>Details</th></tr></thead><tbody id="events"></tbody></table></div></div><div class="panel"><h2>Nodelist Files</h2><div class="sub">Detected nodelist files, last modification and size</div><div class="scroll nodelists-table"><table><thead><tr><th>Network</th><th>File</th><th>Last modified</th><th>Size</th></tr></thead><tbody id="nodelists"></tbody></table></div></div><div class="panel"><h2>Top 10 Users</h2><div class="sub">Successful sessions in selected period</div><div class="scroll top-users-table"><table><thead><tr><th>#</th><th>User</th><th>Sessions</th></tr></thead><tbody id="topUsers"></tbody></table></div></div><div class="panel"><h2>Top 10 Files Download</h2><div class="sub">Downloads in selected period</div><div class="scroll top-files-table"><table><thead><tr><th>#</th><th>File</th><th>Downloads</th></tr></thead><tbody id="topFiles"></tbody></table></div></div></section>
 <footer>Last updated: <span id="updated">—</span> · Auto-refresh every 15 seconds · <span id="logdir"></span></footer></main>
 <script>
 const $=id=>document.getElementById(id);function esc(s){return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
@@ -581,7 +657,7 @@ let max=Math.max(1,...d.countries.map(x=>x.count));liveHTML('countries',d.countr
 liveHTML('sessions',d.sessions.slice(0,80).map(s=>`<tr><td>${esc(s.connected_at.replace('T',' '))}</td><td>${esc(s.node)}</td><td>${esc(s.ip)}<br><span class="sub">${esc(s.country||'Unknown')}</span></td><td>${esc(s.user||'—')}</td><td><span class="pill">${esc(s.service)}</span></td><td>${esc(s.end_reason)}${s.login_success?' · login':''}</td></tr>`).join('')||'<tr><td colspan="6">No sessions</td></tr>');
 const ns=d.network_stats||{};$('networkSummary').textContent=ns.available?`${ns.total.toLocaleString()} received items · ${(ns.bytes/1048576).toFixed(2)} MB total in selected period`:'poll.log and mis.log are not available in C:\mystic\logs';
 liveHTML('networks',ns.available?ns.networks.filter(n=>n.name!=='Other / Unidentified').map(n=>`<tr><td>${esc(n.name)}</td><td>${n.count.toLocaleString()}</td><td>${n.percent}%</td><td>${esc(n.latest.replace('T',' '))}</td></tr>`).join('')||'<tr><td colspan="4">No received items in this period</td></tr>':'<tr><td colspan="4">Waiting for poll.log</td></tr>');
-liveHTML('events',d.mis_events.map(e=>`<tr><td>${esc(e.time.replace('T',' '))}</td><td>${esc(e.type)}</td><td>${esc(e.detail)}</td></tr>`).join('')||'<tr><td colspan="3">No events detected</td></tr>');liveHTML('nodelists',(d.nodelists||[]).map(n=>`<tr title="${esc(n.path)}"><td>${esc(n.network||'Unknown')}</td><td>${esc(n.name)}</td><td>${esc(n.modified.replace('T',' '))}</td><td>${n.bytes.toLocaleString()} B</td></tr>`).join('')||'<tr><td colspan="4">No nodelist files found under C:\\mystic (top level and one subfolder deep)</td></tr>');draw(d.daily);if(d.errors.length)$('notice').textContent+=' Warnings: '+d.errors.join('; ');
+liveHTML('events',d.mis_events.map(e=>`<tr><td>${esc(e.time.replace('T',' '))}</td><td>${esc(e.type)}</td><td>${esc(e.detail)}</td></tr>`).join('')||'<tr><td colspan="3">No events detected</td></tr>');liveHTML('nodelists',(d.nodelists||[]).map(n=>`<tr title="${esc(n.path)}"><td>${esc(n.network||'Unknown')}</td><td>${esc(n.name)}</td><td>${esc(n.modified.replace('T',' '))}</td><td>${n.bytes.toLocaleString()} B</td></tr>`).join('')||'<tr><td colspan="4">No nodelist files found under C:\\mystic (top level and one subfolder deep)</td></tr>');liveHTML('topUsers',(d.top_users||[]).map((u,i)=>`<tr><td>${i+1}</td><td>${esc(u.user)}</td><td>${u.sessions}</td></tr>`).join('')||'<tr><td colspan="3">No authenticated users in this period</td></tr>');liveHTML('topFiles',(d.top_files||[]).map((f,i)=>`<tr><td>${i+1}</td><td title="${esc(f.file)}">${esc(f.file)}</td><td>${f.downloads}</td></tr>`).join('')||'<tr><td colspan="3">No downloads recorded in this period</td></tr>');draw(d.daily);if(d.errors.length)$('notice').textContent+=' Warnings: '+d.errors.join('; ');
 }catch(e){$('notice').textContent='Error: '+e.message+'. Check the shared folder and restart the application.';}}
 function draw(data){let svg=$('chart');svg.innerHTML='';let a=data.slice(-30);if(!a.length){svg.innerHTML='<text x="20" y="80" fill="#9cb0bc">No daily data</text>';return}let ns='http://www.w3.org/2000/svg',W=700,H=180,pL=30,pR=8,pT=12,pB=25,plotH=H-pT-pB,plotW=W-pL-pR,max=Math.max(1,...a.map(x=>x.connections)),maxL=Math.max(1,...a.map(x=>x.logins)),pts=[];[0,.5,1].forEach(v=>{let y=pT+plotH*(1-v),line=document.createElementNS(ns,'line');line.setAttribute('x1',pL);line.setAttribute('x2',W-pR);line.setAttribute('y1',y);line.setAttribute('y2',y);line.setAttribute('stroke','#263844');line.setAttribute('stroke-width','1');svg.appendChild(line);});a.forEach((x,i)=>{let step=plotW/a.length,bw=Math.max(2,step*.62),xx=pL+i*step+(step-bw)/2,hh=plotH*x.connections/max,yy=pT+plotH-hh,r=document.createElementNS(ns,'rect');r.setAttribute('x',xx);r.setAttribute('y',yy);r.setAttribute('width',bw);r.setAttribute('height',Math.max(1,hh));r.setAttribute('rx','1');r.setAttribute('fill','#5ce0a0');r.appendChild(document.createElementNS(ns,'title')).textContent=`${x.date}: ${x.connections} connections, ${x.logins} logins`;svg.appendChild(r);pts.push((xx+bw/2)+','+(pT+plotH-plotH*x.logins/maxL));if(i===0||i===a.length-1||i%Math.ceil(a.length/6)===0){let tx=document.createElementNS(ns,'text');tx.setAttribute('x',xx+bw/2);tx.setAttribute('y',H-7);tx.setAttribute('text-anchor','middle');tx.setAttribute('fill','#9cb0bc');tx.setAttribute('font-size','10');tx.textContent=x.date.slice(5).replace('-','/');svg.appendChild(tx);}});if(pts.length>1){let pl=document.createElementNS(ns,'polyline');pl.setAttribute('points',pts.join(' '));pl.setAttribute('fill','none');pl.setAttribute('stroke','#64c7ef');pl.setAttribute('stroke-width','2');svg.appendChild(pl);}}
 $('refresh').onclick=load;$('period').onchange=load;load();setInterval(load,15000);
