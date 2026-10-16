@@ -367,7 +367,8 @@ def read_nodelist_files():
                 continue
     except OSError:
         return []
-    found.sort(key=lambda x: (x["network"].lower(), x["name"].lower()))
+    # Show the most recently modified nodelist files first. ISO timestamps sort chronologically.
+    found.sort(key=lambda x: x["modified"], reverse=True)
     return found[:100]
 
 
